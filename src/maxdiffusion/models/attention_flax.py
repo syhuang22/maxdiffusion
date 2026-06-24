@@ -583,6 +583,7 @@ def _ulysses_attention(
     use_custom_kernel: bool = False,
     use_base2_exp: bool = True,
     use_experimental_scheduler: bool = False,
+    use_fixed_m: bool = False,
 ) -> jax.Array:
   """Ulysses sequence-parallel attention.
 
@@ -652,9 +653,27 @@ def _ulysses_attention(
       if use_base2_exp:
         query = query * LOG2E
 
+      if use_fixed_m:
+        # k-smoothing (output-invariant): subtracting the per-row key mean
+        # forces every logit row to have mean 0, hence row-max >= 0 — the
+        # precondition that keeps the fixed-m Cauchy-Schwarz bound flush-free.
+        key = key - jnp.mean(key, axis=2, keepdims=True)
+
       query, kv_size, query_seq_len = _pad_data_for_flash(query, heads, bq)
       key, _, key_seq_len = _pad_data_for_flash(key, heads, bkv)
       value, _, _ = _pad_data_for_flash(value, heads, bkv)
+
+      mk_arr = None
+      if use_fixed_m:
+        # Per-(local-)head Cauchy-Schwarz inputs over the (batch, seq) slice;
+        # padded rows have zero norm and never raise the max. mk[0] feeds the
+        # in-kernel per-query bound, mk[1] flags heads within the no-flush gate.
+        qf = query.astype(jnp.float32)
+        kf = key.astype(jnp.float32)
+        qn_max = jnp.sqrt((qf * qf).sum(-1)).max(axis=(0, 2))  # (local_heads,)
+        mk_h = jnp.sqrt((kf * kf).sum(-1)).max(axis=(0, 2))  # (local_heads,)
+        fixed_ok = (qn_max * mk_h <= custom_splash._FIXED_M_SAFE_BOUND).astype(jnp.float32)
+        mk_arr = jnp.stack([mk_h, fixed_ok])  # (2, local_heads)
 
       bsizes = custom_splash._BlockSizes(block_q=bq, block_kv=bkv, block_kv_compute=bkv_compute)
 
@@ -667,10 +686,15 @@ def _ulysses_attention(
           use_base2_exp=use_base2_exp,
           use_experimental_scheduler=use_experimental_scheduler,
           vmem_limit_bytes=vmem_limit_bytes,
+          use_fixed_m=use_fixed_m,
       )
 
-      vmapped_splash = jax.vmap(splash_kernel, in_axes=(0, 0, 0))
-      attention_output = vmapped_splash(query, key, value)
+      if use_fixed_m:
+        vmapped_splash = jax.vmap(splash_kernel, in_axes=(0, 0, 0, None))
+        attention_output = vmapped_splash(query, key, value, mk_arr)
+      else:
+        vmapped_splash = jax.vmap(splash_kernel, in_axes=(0, 0, 0))
+        attention_output = vmapped_splash(query, key, value)
       attention_output = jnp.swapaxes(attention_output, 2, 3)
       attention_output = attention_output[:, :, :query_seq_len, :kv_size].astype(query.dtype)
     else:
@@ -1029,6 +1053,28 @@ def ulysses_custom_kernel(q, k, v, context):
   )
 
 
+@register_kernel("ulysses_custom_fixed_m")
+def ulysses_custom_fixed_m_kernel(q, k, v, context):
+  return _ulysses_attention(
+      q,
+      k * context["scale"],
+      v,
+      context["heads"],
+      context["mesh"],
+      context["axis_names_q"],
+      context["axis_names_kv"],
+      context["flash_block_sizes"],
+      context["dtype"],
+      mask_padding_tokens=context["mask_padding_tokens"],
+      residual_checkpoint_name=context["residual_checkpoint_name"],
+      attention_mask=context["attention_mask"],
+      use_custom_kernel=True,
+      use_base2_exp=context.get("use_base2_exp", True),
+      use_experimental_scheduler=context.get("use_experimental_scheduler", False),
+      use_fixed_m=True,
+  )
+
+
 @register_kernel("ulysses")
 def ulysses_kernel(q, k, v, context):
   return _ulysses_attention(
@@ -1166,7 +1212,7 @@ def _apply_attention(
     seq_len_idx = 2
 
   can_use_flash_attention = True
-  if attention_kernel in ["flash", "tokamax_flash", "ulysses", "ulysses_custom", "ulysses_ring"]:
+  if attention_kernel in ["flash", "tokamax_flash", "ulysses", "ulysses_custom", "ulysses_custom_fixed_m", "ulysses_ring"]:
     can_use_flash_attention = (
         query.shape[seq_len_idx] >= flash_min_seq_length
         and key.shape[seq_len_idx] >= flash_min_seq_length
